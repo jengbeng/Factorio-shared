@@ -5,21 +5,21 @@ set -euo pipefail
 
 # Папка сейвов Factorio на macOS
 FACTORIO_SAVES_DIR_DEFAULT="$HOME/Library/Application Support/factorio/saves"
-
-# Можно переопределить через переменную окружения
 FACTORIO_SAVES_DIR="${FACTORIO_SAVES_DIR:-$FACTORIO_SAVES_DIR_DEFAULT}"
 
 # Имя общего сейва в локальной папке Factorio
 SHARED_SAVE_NAME="${SHARED_SAVE_NAME:-shared.zip}"
 
-# Порт Factorio (по умолчанию 34197/UDP; здесь проверяем TCP как приближение)
+# Порт сервера Factorio (UDP по умолчанию 34197)
 FACTORIO_PORT="${FACTORIO_PORT:-34197}"
 
-# Если хочешь зафиксировать IP (например, IP VPN-сети),
-# экспортируй FACTORIO_HOST_IP перед запуском.
-FACT_HOST_IP_ENV="${FACTORIO_HOST_IP:-}"
+# Интервал heartbeat-пушей (сек) – раз в 3 минуты
+HEARTBEAT_INTERVAL_SEC="${HEARTBEAT_INTERVAL_SEC:-180}"
 
-# Определяем корень репозитория как папку, где лежит этот скрипт
+# TTL статуса хоста (сек) – 3:30
+HOST_TTL_SEC="${HOST_TTL_SEC:-210}"
+
+# Корень репозитория (там, где лежит этот скрипт)
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_DIR"
 
@@ -27,72 +27,39 @@ cd "$REPO_DIR"
 
 usage() {
   cat <<EOF
-Использование: $0 <команда>
-
-Команды:
-  play       - определить хоста, подтянуть последний сейв, либо стать хостом
-  push-save  - залить локальный сейв (shared.zip) обратно в репозиторий
+Использование:
+  Без аргументов:       $0      - интерактивный режим (рекомендуется)
+  Я хочу быть хостом:   $0 host
+  Я клиент:             $0 play
+  Ручной push сейва:    $0 push-save
 
 Переменные окружения (опционально):
-  FACTORIO_SAVES_DIR  - путь к папке сейвов Factorio
-  SHARED_SAVE_NAME    - имя локального сейва (по умолчанию shared.zip)
-  FACTORIO_HOST_IP    - IP, по которому к тебе будут подключаться другие
-  FACTORIO_PORT       - порт Factorio (по умолчанию 34197)
+  FACTORIO_SAVES_DIR       - путь к папке сейвов Factorio
+  SHARED_SAVE_NAME         - имя локального сейва (по умолчанию shared.zip)
+  FACTORIO_PORT            - порт сервера Factorio (по умолчанию 34197)
+  HEARTBEAT_INTERVAL_SEC   - интервал heartbeat-пушей (по умолчанию 180)
+  HOST_TTL_SEC             - TTL статуса хоста (по умолчанию 210)
 EOF
 }
 
-# Получение IP для записи в host.json
-get_host_ip() {
-  if [[ -n "$FACT_HOST_IP_ENV" ]]; then
-    echo "$FACT_HOST_IP_ENV"
-    return 0
-  fi
-
-  # Попытаться взять IP основного интерфейса Wi-Fi (en0 / en1)
-  local ip=""
-  ip="$(ipconfig getifaddr en0 2>/dev/null || true)"
-  if [[ -z "$ip" ]]; then
-    ip="$(ipconfig getifaddr en1 2>/dev/null || true)"
-  fi
-  if [[ -z "$ip" ]]; then
-    # Фоллбек: localhost
-    ip="127.0.0.1"
-  fi
-  echo "$ip"
+get_host_name() {
+  # Без пробелов, чтобы удобно парсить
+  local hn
+  hn="$(scutil --get LocalHostName 2>/dev/null || scutil --get ComputerName 2>/dev/null || hostname)"
+  echo "$hn"
 }
 
-# Чтение IP из meta/host.json без jq
-read_host_ip_from_file() {
-  local file="meta/host.json"
-  if [[ ! -f "$file" ]]; then
-    return 1
-  fi
-  # Простой парсинг "ip": "..."
-  local ip
-  ip="$(grep -oE '"ip"\s*:\s*"[^"]+"' "$file" 2>/dev/null \
-        | sed 's/.*"ip"\s*:\s*"\([^"]*\)".*/\1/')"
-  if [[ -z "$ip" ]]; then
-    return 1
-  fi
-  echo "$ip"
-  return 0
+now_utc_iso() {
+  date -u +"%Y-%m-%dT%H:%M:%SZ"
 }
 
-# Проверка, слушает ли кто-то порт FACTORIO_PORT на IP (примерно)
-check_host_reachable() {
-  local ip="$1"
-  if nc -z "$ip" "$FACTORIO_PORT" 2>/dev/null; then
-    return 0
-  fi
-  return 1
-}
-
-# Копирование сейва из репозитория в локальную папку Factorio
+# Копируем сейв из репозитория в локальную папку Factorio
+# Всегда используем saves/latest.zip как указатель на последний сейв
 copy_save_from_repo_to_factorio() {
   mkdir -p "$FACTORIO_SAVES_DIR"
   if [[ ! -f "saves/latest.zip" ]]; then
     echo "ВНИМАНИЕ: файл saves/latest.zip не найден в репозитории."
-    echo "Проверь, что в репо залит хотя бы один сейв."
+    echo "Сначала добавь туда стартовый сейв."
     return 1
   fi
   cp "saves/latest.zip" "$FACTORIO_SAVES_DIR/$SHARED_SAVE_NAME"
@@ -100,7 +67,10 @@ copy_save_from_repo_to_factorio() {
   echo "  $FACTORIO_SAVES_DIR/$SHARED_SAVE_NAME"
 }
 
-# Копирование сейва из локальной папки Factorio в репозиторий
+# Копируем сейв из локальной папки Factorio в репозиторий
+# Формат:
+#   первое сохранение  -> saves/shared.zip + saves/latest.zip
+#   последующие        -> saves/shared_YYYY-MM-DDTHH-MM-SSZ.zip + saves/latest.zip
 copy_save_from_factorio_to_repo() {
   local src="$FACTORIO_SAVES_DIR/$SHARED_SAVE_NAME"
   if [[ ! -f "$src" ]]; then
@@ -108,142 +78,417 @@ copy_save_from_factorio_to_repo() {
     echo "Убедись, что играл/сохранял именно в $SHARED_SAVE_NAME."
     return 1
   fi
+
   mkdir -p "saves"
+
+  # Проверяем, есть ли уже какие-нибудь shared*.zip (кроме latest.zip)
+  local existing
+  existing="$(ls saves/shared*.zip 2>/dev/null | grep -v 'saves/latest.zip' || true)"
+
+  local ts version_path
+  ts="$(date -u +"%Y-%m-%dT%H-%M-%SZ")"   # UTC, безопасный для имени файла (без :)
+
+  if [[ -z "$existing" ]]; then
+    # Первое сохранение
+    version_path="saves/shared.zip"
+    echo "Первое сохранение: сохраняю как $version_path"
+  else
+    # Следующие версии
+    version_path="saves/shared_${ts}.zip"
+    echo "Новое сохранение: сохраняю как $version_path"
+  fi
+
+  cp "$src" "$version_path"
+  # Обновляем указатель на последний сейв
   cp "$src" "saves/latest.zip"
-  echo "Локальный сейв скопирован в репозиторий: saves/latest.zip"
+
+  echo "Локальный сейв скопирован в:"
+  echo "  версия:  $version_path"
+  echo "  latest:  saves/latest.zip"
 }
 
-# Обновить репозиторий (pull --rebase)
 git_update() {
   git pull --rebase || true
 }
 
-# ===== КОМАНДА play =====
-
-cmd_play() {
-  echo "=== factorio-sync: режим play ==="
-  echo "Папка сейвов Factorio: $FACTORIO_SAVES_DIR"
-  echo
-
-  echo "Шаг 1: обновляем репозиторий (git pull)..."
-  git_update
-  echo
-
-  echo "Шаг 2: пробуем использовать существующего хоста (если есть)..."
-  local ip_existing
-  if ip_existing="$(read_host_ip_from_file)"; then
-    echo "В meta/host.json указан хост: $ip_existing"
-    echo "Проверяем доступность порта $FACTORIO_PORT..."
-    if check_host_reachable "$ip_existing"; then
-      echo
-      echo "Хост доступен: $ip_existing:$FACTORIO_PORT"
-      echo "Действия:"
-      echo "  1) Запусти Factorio на своём Mac."
-      echo "  2) В мультиплеере подключись к адресу: $ip_existing"
-      exit 0
-    else
-      echo "Хост $ip_existing недоступен (порт закрыт или хост не в сети)."
-      echo "Пробуем стать новым хостом."
-    fi
-  else
-    echo "Файл meta/host.json отсутствует или не содержит IP."
-    echo "Будем становиться первым хостом."
+read_host_status() {
+  local file="meta/host.json"
+  if [[ ! -f "$file" ]]; then
+    return 1
   fi
-  echo
 
-  echo "Шаг 3: копируем последний сейв из репозитория в локальную папку Factorio..."
-  copy_save_from_repo_to_factorio
-  echo
+  local online_raw host_raw ts_raw online host_name last_seen
 
-  echo "Шаг 4: определяем IP для хоста..."
-  local my_ip
-  my_ip="$(get_host_ip)"
-  echo "Определён IP хоста: $my_ip"
+  online_raw="$(grep -oE '"online"\s*:\s*(true|false)' "$file" 2>/dev/null || true)"
+  host_raw="$(grep -oE '"host_name"\s*:\s*"[^"]*"' "$file" 2>/dev/null || true)"
+  ts_raw="$(grep -oE '"last_seen"\s*:\s*"[^"]*"' "$file" 2>/dev/null || true)"
 
-  echo "Шаг 5: записываем meta/host.json и пушим (с защитой от гонок)..."
+  if [[ -z "$online_raw" || -z "$ts_raw" ]]; then
+    return 1
+  fi
+
+  online="${online_raw##*: }"
+  host_name="${host_raw#*\"host_name\"*: \"}"
+  host_name="${host_name%\"}"
+
+  last_seen="${ts_raw#*\"last_seen\"*: \"}"
+  last_seen="${last_seen%\"}"
+
+  echo "$online $host_name $last_seen"
+  return 0
+}
+
+write_host_status() {
+  local online="$1"   # true / false
+  local host_name="$2"
+  local ts
+  ts="$(now_utc_iso)"
+
   mkdir -p meta
   cat > meta/host.json <<EOF
 {
-  "ip": "$my_ip"
+  "online": $online,
+  "host_name": "$host_name",
+  "last_seen": "$ts"
 }
 EOF
-
-  git add meta/host.json || true
-  git commit -m "factorio-sync: new host $my_ip" || true
-
-  # Попытка подтянуть возможные изменения и проверить, не появился ли другой хост
-  git_update
-
-  # После pull ещё раз читаем host.json
-  local ip_after_pull
-  if ip_after_pull="$(read_host_ip_from_file)"; then
-    if [[ "$ip_after_pull" != "$my_ip" ]]; then
-      echo
-      echo "Во время обновления репозитория появился другой хост: $ip_after_pull"
-      echo "Значит, мы НЕ будем перезатирать host.json."
-      echo
-      echo "Действия:"
-      echo "  1) Запусти Factorio."
-      echo "  2) Подключись к адресу: $ip_after_pull"
-      exit 0
-    fi
-  fi
-
-  # Если сюда дошли — считаем себя актуальным хостом
-  git push || true
-
-  echo
-  echo "Теперь ТЫ хост."
-  echo "Действия (автоматизированы):"
-  echo "  1) Сейчас будет запущен Factorio на сейве:"
-  echo "       $FACTORIO_SAVES_DIR/$SHARED_SAVE_NAME"
-  echo "  2) Когда закроешь игру, сейв автоматически запушится в репозиторий."
-  echo
-
-  echo "Запускаю Factorio и жду его закрытия..."
-  # -W: ждать, пока приложение завершится
-  open -W -a "Factorio" "$FACTORIO_SAVES_DIR/$SHARED_SAVE_NAME" || {
-    echo "Не удалось запустить Factorio через open -a."
-    exit 1
-  }
-
-  echo
-  echo "Factorio закрыт. Выполняю push-save..."
-  "$0" push-save
 }
 
-# ===== КОМАНДА push-save =====
+host_status_fresh() {
+  local last_seen_iso="$1"
 
-cmd_push_save() {
-  echo "=== factorio-sync: режим push-save ==="
+  local now_ts host_ts
+  now_ts="$(date -u +%s)"
+  host_ts="$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$last_seen_iso" +%s 2>/dev/null || echo 0)"
+
+  if [[ "$host_ts" -eq 0 ]]; then
+    return 1
+  fi
+
+  local diff=$(( now_ts - host_ts ))
+  if (( diff <= HOST_TTL_SEC )); then
+    return 0
+  fi
+  return 1
+}
+
+factorio_running() {
+  # Пытаемся поймать бинарь из .app
+  if pgrep -if "Factorio.app/Contents/MacOS/factorio" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  # Более общий вариант: любой процесс, в имени которого есть "factorio"
+  if pgrep -if "[Ff]actorio" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  return 1
+}
+
+# ===== ВНУТРЕННИЙ push-save (с уже известным host_name) =====
+
+cmd_push_save_internal() {
+  local host_name="$1"
+
+  echo "=== factorio-sync: внутренний push-save ==="
   echo "Папка сейвов Factorio: $FACTORIO_SAVES_DIR"
   echo
 
   echo "Шаг 1: копируем локальный сейв в репозиторий..."
-  copy_save_from_factorio_to_repo
+  copy_save_from_factorio_to_repo || true
   echo
 
-  echo "Шаг 2: коммитим и пушим сейв..."
-  git add saves/latest.zip || true
-  git commit -m "factorio-sync: update save" || true
+  echo "Шаг 2: помечаем хоста как offline и пушим..."
+  write_host_status "false" "$host_name"
+  # Важно: добавляем всю папку saves, чтобы новые версии shared_*.zip попали в коммит
+  git add saves meta/host.json || true
+  git commit -m "factorio-sync: host OFFLINE + save ($host_name)" || true
+  git_update
+  git.push || true || git push || true
+
+  osascript -e 'display notification "Сейв Factorio и статус (offline) запушены" with title "factorio-sync"' || true
+}
+
+# ===== КОМАНДА host =====
+
+cmd_host() {
+  echo "=== factorio-sync: режим host ==="
+  echo "Папка сейвов Factorio: $FACTORIO_SAVES_DIR"
+  echo
+
+  echo "Шаг 1: git pull..."
+  git_update
+  echo
+
+  echo "Шаг 2: проверяем, нет ли уже живого хоста (по TTL)..."
+  local status online host_name last_seen
+  if status="$(read_host_status)"; then
+    online="$(echo "$status" | awk '{print $1}')"
+    host_name="$(echo "$status" | awk '{print $2}')"
+    last_seen="$(echo "$status" | awk '{print $3}')"
+
+    if [[ "$online" == "true" ]] && host_status_fresh "$last_seen"; then
+      echo "Сейчас уже есть живой хост:"
+      echo "  host_name : $host_name"
+      echo "  last_seen : $last_seen (UTC)"
+      echo
+      echo "Просто зайди в Factorio -> multiplayer -> LAN и подключись к этой машине."
+      exit 0
+    else
+      echo "host.json есть, но статус offline или устарел:"
+      echo "  online    : $online"
+      echo "  last_seen : $last_seen (UTC)"
+      echo "Считаем, что активного хоста нет."
+    fi
+  else
+    echo "host.json нет или не читается — считаем, что активного хоста нет."
+  fi
+  echo
+
+  echo "Шаг 3: копируем последний сейв из репозитория в Factorio..."
+  copy_save_from_repo_to_factorio
+  echo
+
+  echo "Шаг 4: помечаем себя как online и пушим (обязательный пуш при старте)..."
+  local my_host_name
+  my_host_name="$(get_host_name)"
+  write_host_status "true" "$my_host_name"
+  git add meta/host.json || true
+  git commit -m "factorio-sync: host ONLINE ($my_host_name)" || true
   git_update
   git push || true
+  echo "Статус хоста (online=true) запушен."
+  echo
+
+  # Проверяем, запущен ли уже Factorio в момент запуска скрипта
+  local was_running_at_start="no"
+  if factorio_running; then
+    was_running_at_start="yes"
+    echo "Factorio уже был запущен до старта скрипта."
+    echo "Не запускаю второй экземпляр, просто начинаю отслеживание."
+  else
+    echo "Factorio ещё не запущен. Запускаю Factorio..."
+    open -n -a "Factorio" "$FACTORIO_SAVES_DIR/$SHARED_SAVE_NAME" || {
+      echo "Не удалось запустить Factorio."
+      exit 1
+    }
+  fi
+
+  echo "Жду, пока Factorio будет запущен хотя бы один раз..."
+  local has_seen_running="false"
+
+  if [[ "$was_running_at_start" == "yes" ]]; then
+    has_seen_running="true"
+  fi
+
+  if [[ "$was_running_at_start" == "no" ]]; then
+    while ! factorio_running; do
+      sleep 2
+    done
+    has_seen_running="true"
+    echo "Factorio запущен. Начинай хостить игру по LAN с сейвом $SHARED_SAVE_NAME."
+  else
+    echo "Factorio уже запущен — отслеживание начато сразу."
+  fi
+  echo
+
+  local last_hb_ts
+  last_hb_ts="$(date -u +%s)"
+
+  echo "Отслеживаю процесс и делаю heartbeat-пуши каждые $HEARTBEAT_INTERVAL_SEC секунд..."
+  while true; do
+    if factorio_running; then
+      local now_ts
+      now_ts="$(date -u +%s)"
+      local diff=$(( now_ts - last_hb_ts ))
+      if (( diff >= HEARTBEAT_INTERVAL_SEC )); then
+        echo "Heartbeat: хост всё ещё онлайн, обновляем last_seen."
+        last_hb_ts="$now_ts"
+        write_host_status "true" "$my_host_name"
+        git add meta/host.json || true
+        git commit -m "factorio-sync: host HEARTBEAT ($my_host_name)" || true
+        git_update
+        git push || true
+      fi
+    else
+      if [[ "$has_seen_running" == "true" ]]; then
+        echo
+        echo "Factorio был запущен и сейчас закрыт. Выполняю финальный пуш сейва и статуса offline..."
+        cmd_push_save_internal "$my_host_name"
+        echo "Режим host завершён."
+        break
+      else
+        echo "Factorio ещё ни разу не был запущен. Жду..."
+      fi
+    fi
+
+    sleep 5
+  done
+}
+
+# ===== КОМАНДА push-save (ручной) =====
+
+cmd_push_save() {
+  echo "=== factorio-sync: режим push-save (ручной) ==="
+  local host_name
+  if status="$(read_host_status)"; then
+    host_name="$(echo "$status" | awk '{print $2}')"
+  else
+    host_name="$(get_host_name)"
+  fi
+  cmd_push_save_internal "$host_name"
+}
+
+# ===== КОМАНДА play (клиент) =====
+
+cmd_play() {
+  echo "=== factorio-sync: режим play (клиент) ==="
+  echo
+
+  echo "Шаг 1: git pull..."
+  git_update
+  echo
+
+  echo "Шаг 2: читаем host.json и проверяем TTL..."
+  local status online host_name last_seen
+
+  if status="$(read_host_status)"; then
+    online="$(echo "$status" | awk '{print $1}')"
+    host_name="$(echo "$status" | awk '{print $2}')"
+    last_seen="$(echo "$status" | awk '{print $3}')"
+
+    if [[ "$online" == "true" ]] && host_status_fresh "$last_seen"; then
+      echo "Есть живой хост:"
+      echo "  host_name : $host_name"
+      echo "  last_seen : $last_seen (UTC)"
+      echo
+      echo "Действия:"
+      echo "  1) Запусти Factorio."
+      echo "  2) В мультиплеере выбери LAN и подключись к машине '$host_name'."
+      exit 0
+    else
+      echo "host.json найден, но статус либо offline, либо устарел:"
+      echo "  online    : $online"
+      echo "  last_seen : $last_seen (UTC)"
+      echo "Считаем, что активного хоста нет."
+    fi
+  else
+    echo "host.json не найден или не читается — считаем, что хоста нет."
+  fi
 
   echo
-  echo "Сейв обновлён в репозитории."
+  echo "Сейчас активного хоста нет."
+  echo "Кто-то из игроков должен выполнить:"
+  echo "  ./factorio-sync host"
+  echo "чтобы стать хостом."
+}
 
-  # macOS-уведомление об успешном пуше
-  osascript -e 'display notification "Сейв Factorio запушен в репозиторий" with title "factorio-sync"' || true
+# ===== КОМАНДА auto (интерактивный режим по умолчанию) =====
+
+cmd_auto() {
+  echo "=== factorio-sync: интерактивный режим ==="
+  echo
+
+  echo "Шаг 1: git pull..."
+  git_update
+  echo
+
+  echo "Шаг 2: состояние репозитория:"
+  local status online host_name last_seen
+  local has_status="no"
+  local fresh="no"
+
+  if status="$(read_host_status)"; then
+    has_status="yes"
+    online="$(echo "$status" | awk '{print $1}')"
+    host_name="$(echo "$status" | awk '{print $2}')"
+    last_seen="$(echo "$status" | awk '{print $3}')"
+
+    echo "  host_name : $host_name"
+    echo "  online    : $online"
+    echo "  last_seen : $last_seen (UTC)"
+
+    if [[ "$online" == "true" ]] && host_status_fresh "$last_seen"; then
+      fresh="yes"
+      echo "  → По TTL: хост считается ОНЛАЙН."
+    else
+      echo "  → По TTL: хост считается ОФФЛАЙН или запись устарела."
+    fi
+  else
+    echo "  host.json отсутствует — никто ещё не запускал сервер."
+  fi
+
+  echo
+  echo "Что ты хочешь сделать?"
+
+  if [[ "$fresh" == "yes" ]]; then
+    echo "  1) Зайти как игрок на уже запущенный сервер."
+    echo "  2) Попробовать самому стать хостом (если уверен, что сервер на самом деле выключен)."
+  else
+    echo "  1) Стать хостом (запустить сервер на этом компьютере)."
+  fi
+
+  echo "  3) Принудительно запушить сейв и статус offline (для этого компьютера)."
+  echo "  0) Ничего не делать и выйти."
+  echo
+
+  read -rp "Выбери номер и нажми Enter: " choice
+
+  case "$choice" in
+    1)
+      if [[ "$fresh" == "yes" ]]; then
+        echo
+        echo "Режим клиента."
+        echo "Действия:"
+        echo "  1) Запусти Factorio."
+        echo "  2) В мультиплеере выбери LAN и подключись к машине '$host_name'."
+        exit 0
+      else
+        echo
+        echo "Запускаю режим host (сервер на этом компьютере)..."
+        cmd_host
+      fi
+      ;;
+    2)
+      if [[ "$fresh" == "yes" ]]; then
+        echo
+        echo "Пытаюсь стать хостом, несмотря на текущую запись о живом хосте."
+        echo "Убедись, что старый сервер реально выключен."
+        cmd_host
+      else
+        echo
+        echo "Активного хоста нет — пункт 2 эквивалентен 'Стать хостом'."
+        cmd_host
+      fi
+      ;;
+    3)
+      echo
+      cmd_push_save
+      ;;
+    0|q|Q)
+      echo "Выход."
+      ;;
+    *)
+      echo "Неизвестный выбор. Ничего не делаю."
+      ;;
+  esac
 }
 
 # ===== РАЗБОР АРГУМЕНТОВ =====
 
 if [[ $# -lt 1 ]]; then
-  usage
-  exit 1
+  cmd_auto
+  exit 0
 fi
 
 case "$1" in
+  auto)
+    cmd_auto
+    ;;
+  host)
+    cmd_host
+    ;;
   play)
     cmd_play
     ;;
