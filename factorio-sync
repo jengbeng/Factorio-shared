@@ -1,87 +1,180 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ================== НАСТРОЙКИ ПО УМОЛЧАНИЮ ==================
+# ================== НАСТРОЙКИ ==================
 
-# Папка сейвов Factorio на macOS
 FACTORIO_SAVES_DIR_DEFAULT="$HOME/Library/Application Support/factorio/saves"
 FACTORIO_SAVES_DIR="${FACTORIO_SAVES_DIR:-$FACTORIO_SAVES_DIR_DEFAULT}"
 
-# Имя общего сейва в локальной папке Factorio
 SHARED_SAVE_NAME="${SHARED_SAVE_NAME:-shared.zip}"
 
-# Порт Factorio (по умолчанию 34197/UDP; тут используем для --join)
 FACTORIO_PORT="${FACTORIO_PORT:-34197}"
 
-# Интервал heartbeat-пушей (секунды)
 HEARTBEAT_INTERVAL_SEC="${HEARTBEAT_INTERVAL_SEC:-180}"
-
-# TTL статуса хоста (секунды)
 HOST_TTL_SEC="${HOST_TTL_SEC:-210}"
 
-# Корень репозитория (где лежит этот скрипт)
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_DIR"
 
 HOST_FILE="meta/host.json"
 
-# ================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==================
+# ================== GIT ==================
 
-usage() {
-  cat <<EOF
-Использование: $0 [команда]
-
-Команды:
-  init        - первичная настройка репозитория и GitHub
-  auto        - умный режим (по умолчанию): сам подберёт роль
-  host        - стать хостом (поднять сервер на этом Mac)
-  play        - автоподключение или хостинг (авторежим)
-  push-save   - вручную запушить сейв и пометить offline
-
-Если команду не указать, работает как: $0 auto
-EOF
+ensure_git_available() {
+  if ! command -v git >/dev/null 2>&1; then
+    echo "ERROR: Git не установлен."
+    echo "Установи Xcode Command Line Tools:"
+    echo "  xcode-select --install"
+    exit 1
+  fi
 }
 
-# ---- Git / GitHub ----
-
-git_update() {
-  # Обновляем, но не валим скрипт, если есть локальные изменения
-  git pull --rebase || {
-    echo "git pull --rebase не удалось (возможно, есть локальные незакоммиченные изменения). Продолжаю."
-  }
+ensure_repo_present() {
+  if [[ ! -d ".git" ]]; then
+    echo "В этой папке нет git-репозитория."
+    echo "Сначала запусти:"
+    echo "  $0 init"
+    exit 1
+  fi
 }
 
-# ---- VPN (опционально: Tailscale) ----
+fix_incomplete_rebase_if_any() {
+  if [[ -d ".git/rebase-merge" || -d ".git/rebase-apply" ]]; then
+    echo "Обнаружен незавершённый rebase. Выполняю 'git rebase --abort'..."
+    git rebase --abort || echo "Не удалось прервать rebase, продолжу работу."
+  fi
+}
 
-ensure_vpn() {
-  # Если tailscale не установлен — просто выходим
-  if ! command -v tailscale >/dev/null 2>&1; then
+ensure_upstream_tracking() {
+  if ! git remote get-url origin >/dev/null 2>&1; then
     return 0
   fi
 
-  echo "Проверяю состояние Tailscale..."
-  if tailscale status >/dev/null 2>&1; then
-    echo "Tailscale уже запущен."
-  else
-    echo "Tailscale не запущен — выполняю 'tailscale up' (однократно потребуется вход через браузер)."
-    if ! tailscale up; then
-      echo "Не удалось выполнить 'tailscale up'. Продолжаю без жёсткого требования VPN."
-      return 0
-    fi
+  local branch
+  branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+  if [[ -z "$branch" || "$branch" == "HEAD" ]]; then
+    return 0
   fi
 
-  # Опциональная проверка, что другая сторона доступна
-  if [[ -n "${FACTORIO_VPN_CHECK_HOST:-}" ]]; then
-    if ping -c1 -W1 "$FACTORIO_VPN_CHECK_HOST" >/dev/null 2>&1; then
-      echo "VPN-хост ${FACTORIO_VPN_CHECK_HOST} доступен."
-    else
-      echo "VPN-хост ${FACTORIO_VPN_CHECK_HOST} не пингуется. Возможно, другая сторона не в сети."
-    fi
+  if git rev-parse --abbrev-ref --symbolic-full-name "@{u}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+    echo "Привязываю локальную ветку '$branch' к origin/$branch..."
+    git branch --set-upstream-to="origin/$branch" "$branch" || true
   fi
 }
 
+ensure_git_credential_helper() {
+  if ! git config --global credential.helper >/dev/null 2>&1; then
+    git config --global credential.helper osxkeychain || true
+  fi
+}
+
+ensure_git_ready() {
+  ensure_git_available
+  ensure_repo_present
+  fix_incomplete_rebase_if_any
+  ensure_upstream_tracking
+  ensure_git_credential_helper
+}
+
+git_update() {
+  ensure_git_ready
+  git pull --rebase || {
+    echo "Предупреждение: 'git pull --rebase' не выполнился (возможно, есть незакоммиченные изменения). Продолжаю."
+  }
+}
+
+# ================== VPN (TAILSCALE) ==================
+
+ensure_vpn_full() {
+  echo "=== Самодиагностика VPN (Tailscale) ==="
+
+  # 0. Удаляем GUI-клиент, если он есть, чтобы не мешал демону
+  if [ -d "/Applications/Tailscale.app" ]; then
+    echo "→ Найден GUI Tailscale, удаляю (используем brew-версию)..."
+    sudo killall Tailscaled 2>/dev/null || true
+    sudo killall Tailscale 2>/dev/null || true
+    sudo rm -rf "/Applications/Tailscale.app"
+  fi
+
+  # 1. Homebrew
+  if ! command -v brew >/dev/null 2>&1; then
+    echo "✗ Homebrew не найден. Устанавливаю Homebrew..."
+    NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    echo "✓ Homebrew установлен."
+    eval "$(/opt/homebrew/bin/brew shellenv)" 2>/dev/null || true
+  else
+    echo "✓ Homebrew найден."
+  fi
+
+  # 2. tailscale
+  if ! command -v tailscale >/dev/null 2>&1; then
+    echo "✗ tailscale не найден — устанавливаю через Homebrew..."
+    brew install tailscale || {
+      echo "✗ Не удалось установить tailscale. Продолжаю без VPN."
+      echo
+      return 0
+    }
+    echo "✓ tailscale установлен."
+  else
+    echo "✓ tailscale найден."
+  fi
+
+  # 3. tailscaled как служба
+  echo "→ Запускаю службу tailscaled..."
+  brew services start tailscale >/dev/null 2>&1 || true
+  sleep 2
+
+  if ! tailscale status >/dev/null 2>&1; then
+    echo "✗ tailscaled не запустился через brew services. Пробую вручную..."
+    /opt/homebrew/opt/tailscale/bin/tailscaled >/dev/null 2>&1 &
+    sleep 2
+  fi
+
+  if tailscale status >/dev/null 2>&1; then
+    echo "✓ tailscaled запущен."
+  else
+    echo "✗ tailscaled не запускается. Продолжаю без VPN."
+    echo
+    return 0
+  fi
+
+  # 4. tailscale up
+  echo "→ Выполняю 'tailscale up' (должен открыться браузер для входа)..."
+  if ! tailscale up; then
+    echo "✗ tailscale up завершился с ошибкой."
+    echo "  Открою страницу Tailscale в браузере для ручного логина..."
+    open "https://login.tailscale.com/admin/machines" || true
+    echo
+    return 0
+  fi
+
+  # 5. IP
+  local ip
+  ip="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
+  if [[ -n "$ip" ]]; then
+    echo "✓ Tailscale IP: $ip"
+  else
+    echo "✗ Не удалось получить Tailscale IP."
+  fi
+
+  # 6. Проверка узла (если задан)
+  if [[ -n "${FACTORIO_VPN_CHECK_HOST:-}" ]]; then
+    echo "→ Проверяю связь с ${FACTORIO_VPN_CHECK_HOST}..."
+    if ping -c1 -W1 "$FACTORIO_VPN_CHECK_HOST" >/dev/null 2>&1; then
+      echo "✓ Узел ${FACTORIO_VPN_CHECK_HOST} доступен по VPN."
+    else
+      echo "✗ Узел ${FACTORIO_VPN_CHECK_HOST} не пингуется (возможно, другая сторона оффлайн)."
+    fi
+  fi
+
+  echo
+}
+
 get_vpn_ip() {
-  # Если tailscale есть — берём его IPv4
   if command -v tailscale >/dev/null 2>&1; then
     local ip
     ip="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
@@ -109,13 +202,13 @@ get_host_name_simple() {
   scutil --get ComputerName 2>/dev/null || hostname
 }
 
-# ---- Работа с сейвами ----
+# ================== СЕЙВЫ ==================
 
 copy_save_from_repo_to_factorio() {
   mkdir -p "$FACTORIO_SAVES_DIR"
   if [[ ! -f "saves/latest.zip" ]]; then
-    echo "Внимание: файл saves/latest.zip не найден в репозитории."
-    echo "Сначала кто-то должен запушить стартовый сейв."
+    echo "Внимание: saves/latest.zip не найден в репозитории."
+    echo "Сначала нужно загрузить стартовый сейв (push-save после первой игры)."
     return 1
   fi
   cp "saves/latest.zip" "$FACTORIO_SAVES_DIR/$SHARED_SAVE_NAME"
@@ -126,21 +219,19 @@ copy_save_from_repo_to_factorio() {
 copy_save_from_factorio_to_repo() {
   local src="$FACTORIO_SAVES_DIR/$SHARED_SAVE_NAME"
   if [[ ! -f "$src" ]]; then
-    echo "Внимание: локальный сейв \"$src\" не найден."
-    echo "Убедись, что играл/сохранял именно в $SHARED_SAVE_NAME."
+    echo "Локальный сейв "$src" не найден."
+    echo "Убедись, что играешь и сохраняешь в $SHARED_SAVE_NAME."
     return 1
   fi
 
   mkdir -p "saves"
 
-  # Есть ли уже версии shared*.zip (кроме latest)?
   local existing
   existing=$(find saves -maxdepth 1 -type f -name "shared*.zip" ! -name "latest.zip" | head -n1 || true)
 
-  local ts
+  local ts version_path
   ts="$(date -u +"%Y-%m-%dT%H-%M-%SZ")"
 
-  local version_path
   if [[ -z "$existing" ]]; then
     version_path="saves/shared.zip"
     echo "Первое сохранение: $version_path"
@@ -152,23 +243,20 @@ copy_save_from_factorio_to_repo() {
   cp "$src" "$version_path"
   cp "$src" "saves/latest.zip"
 
-  echo "Локальный сейв сохранён:"
-  echo "  версия:  $version_path"
-  echo "  latest:  saves/latest.zip"
+  echo "Сейв сохранён:"
+  echo "  версия: $version_path"
+  echo "  latest: saves/latest.zip"
 }
 
-# ---- host.json ----
+# ================== HOST.JSON ==================
 
 read_host_field() {
   local key="$1"
   if [[ ! -f "$HOST_FILE" ]]; then
     return 1
   fi
-  # Парсим строки вида "key": "value"
   local val
-  val="$(grep -oE "\"$key\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$HOST_FILE" 2>/dev/null \
-        | sed -E "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/\1/" \
-        | head -n1 || true)"
+  val="$(grep -oE ""$key"[[:space:]]*:[[:space:]]*"[^"]*"" "$HOST_FILE" 2>/dev/null         | sed -E "s/.*"$key"[[:space:]]*:[[:space:]]*"([^"]*)".*//"         | head -n1 || true)"
   if [[ -z "$val" ]]; then
     return 1
   fi
@@ -176,7 +264,7 @@ read_host_field() {
 }
 
 write_host_status() {
-  local online="$1"      # "true" / "false"
+  local online="$1"
   local host_name="$2"
   local vpn_ip="$3"
 
@@ -196,56 +284,60 @@ EOF
 }
 
 host_is_fresh() {
-  # true, если host.json говорит online=="true" и last_seen не старше TTL
   if [[ ! -f "$HOST_FILE" ]]; then
-    return 1
+    return 0  # нет файла = считаем, что хоста нет
   fi
 
   local online
   online="$(read_host_field "online" || true)"
   if [[ "$online" != "true" ]]; then
-    return 1
+    return 0
   fi
 
   local last_seen_iso
   last_seen_iso="$(read_host_field "last_seen" || true)"
   if [[ -z "$last_seen_iso" ]]; then
-    return 1
+    return 0
   fi
 
-  # Переводим ISO → epoch (сек) с помощью BSD date
   local last_epoch
   if ! last_epoch="$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$last_seen_iso" "+%s" 2>/dev/null)"; then
-    return 1
+    return 0
   fi
   local now_epoch
   now_epoch="$(date -u "+%s")"
 
   local diff=$(( now_epoch - last_epoch ))
   if (( diff <= HOST_TTL_SEC )); then
-    return 0
+    return 1   # свежий
   fi
-
-  return 1
+  return 0
 }
 
-# ---- Проверка процесса Factorio ----
+# ================== FACTORIO ==================
 
 factorio_running() {
   pgrep -x "factorio" >/dev/null 2>&1 || pgrep -x "Factorio" >/dev/null 2>&1
 }
 
-# ================== КОМАНДЫ ==================
+check_factorio_installed() {
+  if ! open -Ra "Factorio" >/dev/null 2>&1; then
+    echo "Предупреждение: Factorio.app не найден через 'open -Ra'."
+    echo "Убедись, что игра установлена (Steam или standalone)."
+  fi
+}
 
-# ---- init ----
+# ================== КОМАНДЫ ==================
 
 cmd_init() {
   echo "=== factorio-sync (macOS): init ==="
   echo "Текущая папка: $REPO_DIR"
   echo
 
+  ensure_git_available
+
   if [[ ! -d ".git" ]]; then
-    echo "Здесь ещё нет git-репозитория. Создаю..."
+    echo "Создаю git-репозиторий..."
     git init
     echo
   fi
@@ -256,53 +348,39 @@ cmd_init() {
     origin="$(git remote get-url origin)"
     echo "origin уже настроен: $origin"
   else
-    echo "origin не настроен."
+    echo "origin ещё не настроен."
     read -r -p "Вставь URL репозитория на GitHub (или Enter, чтобы пропустить): " remote_url || true
     if [[ -n "${remote_url:-}" ]]; then
       git remote add origin "$remote_url"
       echo "Добавлен origin: $remote_url"
     else
-      echo "origin можно настроить позже командой:"
+      echo "origin можно настроить позже:"
       echo "  git remote add origin https://github.com/USER/REPO.git"
     fi
   fi
 
-  echo
-  read -r -p "Настроить сохранение GitHub-токена в macOS Keychain (рекомендуется)? [Y/n] " ans || true
-  if [[ -z "$ans" || "$ans" =~ ^[Yy]$ ]]; then
-    git config --global credential.helper osxkeychain || true
-    echo "Глобальный credential.helper=osxkeychain установлен."
-  else
-    echo "Оставляю GitHub-авторизацию как есть."
-  fi
+  ensure_git_credential_helper
 
   echo
-  echo "Создаю служебные папки saves и meta (если ещё нет)..."
+  echo "Создаю папки saves и meta..."
   mkdir -p saves meta
   echo "Готово."
   echo
-
-  echo "Папка сейвов Factorio по умолчанию:"
-  echo "  $FACTORIO_SAVES_DIR"
-  echo "При необходимости можно переопределить переменной окружения FACTORIO_SAVES_DIR."
-  echo
-
   echo "Дальше:"
-  echo "  $0 auto        # умный режим (рекомендуется)"
-  echo "  $0 host        # сразу стать хостом"
-  echo "  $0 play        # авто: подключиться или стать хостом"
+  echo "  $0 auto  - интерактивный режим"
+  echo "  $0 play  - авто: подключиться или стать хостом"
+  echo "  $0 host  - принудительно стать хостом"
 }
-
-# ---- host ----
 
 cmd_host() {
   echo "=== factorio-sync (macOS): host ==="
   echo "Папка сейвов Factorio: $FACTORIO_SAVES_DIR"
   echo
 
-  echo "Шаг 0: VPN (если настроен Tailscale)..."
-  ensure_vpn
-  echo
+  ensure_git_ready
+
+  echo "Шаг 0: VPN (Tailscale)..."
+  ensure_vpn_full
 
   echo "Шаг 1: git pull..."
   git_update
@@ -320,23 +398,21 @@ cmd_host() {
     echo "  vpn_ip    : $vpn_ip"
     echo "  last_seen : $last_seen"
     echo
-    echo "Тебе не нужно становиться хостом. Просто подключись к этому серверу:"
+    echo "Тебе не обязательно становиться хостом."
     if [[ "$vpn_ip" != "?" && -n "$vpn_ip" ]]; then
-      echo "  Адрес (VPN/Tailscale): $vpn_ip:$FACTORIO_PORT"
+      echo "Можно подключиться по адресу: $vpn_ip:$FACTORIO_PORT"
     fi
-    echo
-    echo "Запусти Factorio → Multiplayer → Connect to address / LAN."
     return 0
   else
-    echo "Живого хоста по TTL нет. Будем становиться хостом."
+    echo "Живого хоста по TTL нет. Становимся хостом на этом Mac."
   fi
   echo
 
-  echo "Шаг 3: копируем последний сейв из репозитория в локальную папку Factorio..."
+  echo "Шаг 3: копируем последний сейв в локальную папку Factorio..."
   copy_save_from_repo_to_factorio || return 1
   echo
 
-  echo "Шаг 4: помечаем себя как online и пушим (обязательный пуш при старте)..."
+  echo "Шаг 4: помечаем себя ONLINE и пушим..."
   local my_host my_ip_vpn my_ip
   my_host="$(get_host_name_simple)"
   my_ip_vpn="$(get_vpn_ip || true)"
@@ -352,19 +428,19 @@ cmd_host() {
   git_update
   git push || true
 
-  echo "Теперь ты помечен как хост:"
+  echo "Теперь ты хост:"
   echo "  host_name : $my_host"
   echo "  ip        : $my_ip"
   echo
 
-  echo "Шаг 5: запускаю Factorio на сейве:"
-  echo "  $FACTORIO_SAVES_DIR/$SHARED_SAVE_NAME"
+  echo "Шаг 5: запускаю Factorio..."
+  check_factorio_installed
   open -a "Factorio" "$FACTORIO_SAVES_DIR/$SHARED_SAVE_NAME" || {
     echo "Не удалось запустить Factorio через 'open -a Factorio'. Запусти игру вручную."
   }
 
   echo
-  echo "Отслеживаю процесс Factorio и делаю heartbeat-пуши каждые $HEARTBEAT_INTERVAL_SEC секунд..."
+  echo "Отслеживаю процесс Factorio и делаю heartbeat-пуши каждые $HEARTBEAT_INTERVAL_SEC сек..."
   local last_hb_ts
   last_hb_ts="$(date -u "+%s")"
   local seen_running="false"
@@ -376,7 +452,7 @@ cmd_host() {
       now_ts="$(date -u "+%s")"
       diff=$(( now_ts - last_hb_ts ))
       if (( diff >= HEARTBEAT_INTERVAL_SEC )); then
-        echo "Heartbeat: хост всё ещё онлайн, обновляем last_seen..."
+        echo "Heartbeat: хост онлайн, обновляю last_seen..."
         last_hb_ts="$now_ts"
         write_host_status "true" "$my_host" "$my_ip"
         git add "$HOST_FILE" >/dev/null 2>&1 || true
@@ -387,31 +463,30 @@ cmd_host() {
     else
       if [[ "$seen_running" == "true" ]]; then
         echo
-        echo "Factorio закрыт. Выполняю финальный пуш сейва и статуса offline..."
-        # Копируем сейв обратно в репозиторий
-        copy_save_from_factorio_to_repo || echo "Не удалось скопировать сейв из локальной папки."
+        echo "Factorio закрыт. Финальный push сейва и статуса OFFLINE..."
+        copy_save_from_factorio_to_repo || echo "Не удалось скопировать сейв."
         write_host_status "false" "$my_host" "$my_ip"
         git add saves/latest.zip "$HOST_FILE" >/dev/null 2>&1 || true
         git commit -m "factorio-sync(mac): host OFFLINE + save ($my_host)" >/dev/null 2>&1 || true
         git_update
         git push || true
-        echo "Режим host завершён."
+        echo "Готово."
         break
       fi
     fi
-
     sleep 5
   done
 }
-
-# ---- push-save (ручной) ----
 
 cmd_push_save() {
   echo "=== factorio-sync (macOS): push-save ==="
   echo "Папка сейвов Factorio: $FACTORIO_SAVES_DIR"
   echo
 
+  ensure_git_ready
+
   copy_save_from_factorio_to_repo || return 1
+
   local my_host my_ip_vpn my_ip
   my_host="$(get_host_name_simple)"
   my_ip_vpn="$(get_vpn_ip || true)"
@@ -427,19 +502,17 @@ cmd_push_save() {
   git_update
   git push || true
 
-  echo
-  echo "Сейв и статус offline запушены в репозиторий."
+  echo "Сейв и статус OFFLINE запушены."
 }
-
-# ---- play (авторежим: клиент или хост) ----
 
 cmd_play() {
   echo "=== factorio-sync (macOS): play (авторежим) ==="
   echo
 
-  echo "Шаг 0: VPN (если настроен Tailscale)..."
-  ensure_vpn
-  echo
+  ensure_git_ready
+
+  echo "Шаг 0: VPN (Tailscale)..."
+  ensure_vpn_full
 
   echo "Шаг 1: git pull..."
   git_update
@@ -459,19 +532,20 @@ cmd_play() {
     echo
 
     if [[ -n "$vpn_ip" ]]; then
-      echo "Пробую автоматически запустить Factorio и подключиться к хосту по VPN ($vpn_ip)..."
+      echo "Пробую автоматически запустить Factorio и подключиться к $vpn_ip..."
+      check_factorio_installed
       if open -a "Factorio" --args --join "$vpn_ip" --port "$FACTORIO_PORT" 2>/dev/null; then
-        echo "Factorio запущен с параметрами подключения. Если что-то пойдёт не так — подключись вручную по адресу: $vpn_ip:$FACTORIO_PORT"
+        echo "Factorio запущен с параметрами подключения."
+        echo "Если авто-подключение не сработает, используй адрес: $vpn_ip:$FACTORIO_PORT"
       else
-        echo "Не удалось передать параметры --join в Factorio."
-        echo "Подключись вручную:"
-        echo "  адрес: $vpn_ip:$FACTORIO_PORT"
-        echo "  Multiplayer → Connect to address"
+        echo "Не удалось передать --join в Factorio."
+        echo "Подключись вручную по адресу: $vpn_ip:$FACTORIO_PORT"
       fi
     else
       echo "vpn_ip в host.json не задан."
-      echo "Подключись по локальному списку LAN или имени хоста: $host_name"
+      echo "Подключись по LAN-списку или имени хоста: $host_name"
     fi
+
     return 0
   else
     echo "Живого хоста по TTL нет (host.json отсутствует или устарел)."
@@ -481,22 +555,21 @@ cmd_play() {
   fi
 }
 
-# ---- auto (интерактивный режим) ----
-
 cmd_auto() {
   echo "=== factorio-sync (macOS): интерактивный режим ==="
   echo
 
   if [[ ! -d ".git" ]]; then
-    echo "В этой папке ещё нет git-репозитория."
-    echo "Сначала выполни:"
+    echo "Здесь ещё нет git-репозитория."
+    echo "Сначала запусти:"
     echo "  $0 init"
     return 1
   fi
 
-  echo "Шаг 0: VPN (если настроен Tailscale)..."
-  ensure_vpn
-  echo
+  ensure_git_ready
+
+  echo "Шаг 0: VPN (Tailscale)..."
+  ensure_vpn_full
 
   echo "Шаг 1: git pull..."
   git_update
@@ -504,36 +577,36 @@ cmd_auto() {
 
   echo "Шаг 2: состояние хоста:"
   local host_name vpn_ip last_seen
-  local fresh="false"
+  local fresh="0"
   if host_is_fresh; then
-    fresh="true"
+    fresh="1"
     host_name="$(read_host_field "host_name" || echo "?")"
     vpn_ip="$(read_host_field "vpn_ip" || echo "-")"
     last_seen="$(read_host_field "last_seen" || echo "?")"
     echo "  host_name : $host_name"
     echo "  vpn_ip    : $vpn_ip"
     echo "  last_seen : $last_seen"
-    echo "  → Хост считается ОНЛАЙН по TTL."
+    echo "  → Хост считается ONLINE по TTL."
   else
     echo "  Живой хост не найден (host.json отсутствует или TTL истёк)."
   fi
   echo
 
-  echo "Выбери, что сделать:"
-  if [[ "$fresh" == "true" ]]; then
+  echo "Выбери действие:"
+  if [[ "$fresh" == "1" ]]; then
     echo "  1) Зайти как игрок на уже запущенный сервер."
-    echo "  2) Стать хостом на этом Mac (перехватить роль)."
+    echo "  2) Стать хостом на этом Mac."
   else
     echo "  1) Стать хостом на этом Mac."
   fi
-  echo "  3) Принудительно запушить сейв и пометить offline."
+  echo "  3) Принудительно запушить сейв и пометить OFFLINE."
   echo "  0) Выйти."
   echo
 
   read -r -p "Твой выбор: " choice || true
   case "$choice" in
     1)
-      if [[ "$fresh" == "true" ]]; then
+      if [[ "$fresh" == "1" ]]; then
         cmd_play
       else
         cmd_host
@@ -575,7 +648,8 @@ case "$cmd" in
     cmd_auto
     ;;
   *)
-    usage
+    echo "Неизвестная команда: $cmd"
+    echo "Использование: $0 [init|auto|host|play|push-save]"
     exit 1
     ;;
 esac
