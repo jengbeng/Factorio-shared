@@ -255,12 +255,24 @@ read_host_field() {
   if [[ ! -f "$HOST_FILE" ]]; then
     return 1
   fi
-  local val
-  val="$(grep -oE ""$key"[[:space:]]*:[[:space:]]*"[^"]*"" "$HOST_FILE" 2>/dev/null         | sed -E "s/.*"$key"[[:space:]]*:[[:space:]]*"([^"]*)".*//"         | head -n1 || true)"
-  if [[ -z "$val" ]]; then
-    return 1
-  fi
-  echo "$val"
+
+  python3 - "$key" "$HOST_FILE" <<'EOF' 2>/dev/null
+import json, sys
+key = sys.argv[1]
+path = sys.argv[2]
+try:
+    with open(path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    val = data.get(key, "")
+    if isinstance(val, bool):
+        print("true" if val else "false")
+    elif val is None:
+        pass
+    else:
+        print(str(val))
+except Exception:
+    pass
+EOF
 }
 
 write_host_status() {
